@@ -1,0 +1,21 @@
+{
+  "name": "timeincoss/hpyerdb",
+  "description": "HyperDB is an advanced database class that supports replication, failover, load balancing, and partitioning.",
+  "homepage": "https://github.com/TimeIncOSS/hyperdb",
+  "type": "wordpress-plugin",
+  "license": "GPL-2.0+",
+  "authors": [
+    {
+      "name": "Time Inc UK",
+      "homepage": "http://www.timeincuk.com/"
+    },
+    {
+      "name"    : "Automattic",
+      "homepage": "http://automattic.com/"
+    }
+  ],
+  "require": {
+    "composer/installers": "~1.0"
+  }
+}
+
