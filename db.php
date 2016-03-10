@@ -175,6 +175,11 @@ class hyperdb extends wpdb {
 	var $default_lag_threshold = null;
 
 	/**
+	 * @var bool
+	 */
+	var $dbclose = false;
+
+	/**
 	 * Gets ready to make database connections
 	 *
 	 * @param array db class vars
@@ -210,40 +215,6 @@ class hyperdb extends wpdb {
 		}
 
 		$this->init_charset();
-	}
-
-	/**
-	 * Set $this->charset and $this->collate
-	 *
-	 * @since 3.1.0
-	 */
-	public function init_charset() {
-		if ( function_exists( 'is_multisite' ) && is_multisite() ) {
-			$this->charset = 'utf8';
-			if ( defined( 'DB_COLLATE' ) && DB_COLLATE ) {
-				$this->collate = DB_COLLATE;
-			} else {
-				$this->collate = 'utf8_general_ci';
-			}
-		} elseif ( defined( 'DB_COLLATE' ) ) {
-			$this->collate = DB_COLLATE;
-		}
-
-		if ( defined( 'DB_CHARSET' ) ) {
-			$this->charset = DB_CHARSET;
-		}
-
-		if ( ( $this->use_mysqli && ! ( $this->dbh instanceof mysqli ) ) || empty( $this->dbh ) ) {
-			return;
-		}
-
-		if ( 'utf8' === $this->charset && $this->has_cap( 'utf8mb4' ) ) {
-			$this->charset = 'utf8mb4';
-		}
-
-		if ( 'utf8mb4' === $this->charset && ( ! $this->collate || stripos( $this->collate, 'utf8_' ) === 0 ) ) {
-			$this->collate = 'utf8mb4_unicode_ci';
-		}
 	}
 
 	/**
@@ -337,6 +308,7 @@ class hyperdb extends wpdb {
 				return $result;
 			}
 		}
+
 		return false;
 	}
 
@@ -348,18 +320,6 @@ class hyperdb extends wpdb {
 	 * @return resource mysql database connection
 	 */
 	function db_connect( $query = '' ) {
-		if ( $this->use_mysqli ) {
-			$connect_function   = $this->persistent ? 'mysqli_pconnect' : 'mysqli_connect';
-			$select_db_function = 'mysqli_select_db';
-			$error_db_function  = 'mysqli_error';
-			$ping_db_function   = 'mysqli_ping';
-		} else {
-			$connect_function   = $this->persistent ? 'mysql_pconnect' : 'mysql_connect';
-			$select_db_function = 'mysql_select_db';
-			$error_db_function  = 'mysql_error';
-			$ping_db_function   = 'mysql_ping';
-		}
-
 
 		if ( empty( $this->hyper_servers ) ) {
 			if ( is_resource( $this->dbh ) ) {
@@ -373,20 +333,13 @@ class hyperdb extends wpdb {
 			) {
 				return $this->bail( "We were unable to query because there was no database defined." );
 			}
-			$this->dbh = @ $connect_function( DB_HOST, DB_USER, DB_PASSWORD, true );
-			if ( ! is_resource( $this->dbh ) ) {
-				return $this->bail( "We were unable to connect to the database. (DB_HOST)" );
-			}
 
-			$mysql_select_db = $select_db_function( DB_NAME, $this->dbh );
+			$this->dbuser     = DB_USER;
+			$this->dbpassword = DB_PASSWORD;
+			$this->dbname     = DB_NAME;
+			$this->dbhost     = DB_HOST;
 
-			if ( ! $mysql_select_db ) {
-				return $this->bail( "We were unable to select the database." );
-			}
-			if ( ! empty( $this->charset ) ) {
-				$_collate = ! empty( $this->collate ) ? $this->collate : null;
-				$this->set_charset( $this->dbh, $this->charset, $_collate );
-			}
+			parent::db_connect();
 
 			return $this->dbh;
 		}
@@ -462,12 +415,10 @@ class hyperdb extends wpdb {
 				// A callback has specified a database name so it's possible the existing connection selected a different one.
 				if ( $name != $this->used_servers[ $dbhname ]['name'] ) {
 
-					$mysql_select_db = $select_db_function( $name, $this->dbhs[ $dbhname ] );
-
-					if ( ! $mysql_select_db ) {
+					if ( ! $this->select_db( $name, $this->dbhs[ $dbhname ] ) ) {
 						// this can happen when the user varies and lacks permission on the $name database
 						if ( isset( $conn['disconnect (select failed)'] ) ) {
-							++ $conn['disconnect (select failed)'];
+							$conn['disconnect (select failed)']++;
 						} else {
 							$conn['disconnect (select failed)'] = 1;
 						}
@@ -490,15 +441,18 @@ class hyperdb extends wpdb {
 			}
 
 			$this->last_used_server = $this->used_servers[ $dbhname ];
-			$this->last_connection  = compact( 'dbhname', 'name' );
+			$this->last_connection  = array( $dbhname, $name );
 
-
-			$mysql_ping = $ping_db_function( $this->dbhs[ $dbhname ] );
+			if ( $this->use_mysqli ) {
+				$mysql_ping = mysqli_ping( $this->dbhs[ $dbhname ] );
+			} else {
+				$mysql_ping = mysql_ping( $this->dbhs[ $dbhname ] );
+			}
 
 
 			if ( ! $mysql_ping ) {
 				if ( isset( $conn['disconnect (ping failed)'] ) ) {
-					++ $conn['disconnect (ping failed)'];
+					$conn['disconnect (ping failed)']++;
 				} else {
 					$conn['disconnect (ping failed)'] = 1;
 				}
@@ -508,7 +462,7 @@ class hyperdb extends wpdb {
 			}
 
 			if ( isset( $conn['queries'] ) ) {
-				++ $conn['queries'];
+				$conn['queries']++;
 			} else {
 				$conn['queries'] = 1;
 			}
@@ -534,7 +488,7 @@ class hyperdb extends wpdb {
 				$keys = array_keys( $items );
 				shuffle( $keys );
 				foreach ( $keys as $key ) {
-					$servers[] = compact( 'group', 'key' );
+					$servers[] = array( $group, $key );
 				}
 			}
 
@@ -626,7 +580,7 @@ class hyperdb extends wpdb {
 				if ( $use_master || ! $tries_remaining || ! $this->check_tcp_responsiveness
 				     || true === $tcp = $this->check_tcp_responsiveness( $host, $port, $timeout )
 				) {
-					$this->dbhs[ $dbhname ] = @ $connect_function( "$host:$port", $user, $password, true );
+					$this->dbhs[ $dbhname ] = $this->db_connect_single( $host, $user, $password, $port );
 				} else {
 					$this->dbhs[ $dbhname ] = false;
 				}
@@ -655,13 +609,13 @@ class hyperdb extends wpdb {
 						$msg                    = "Replication lag of {$this->lag}s on $host:$port ($dbhname)";
 						$this->print_error( $msg );
 						continue;
-					} elseif ( $select_db_function( $name, $this->dbhs[ $dbhname ] ) ) {
+					} elseif ( $this->select_db( $name, $this->dbhs[ $dbhname ] ) ) {
 						$success                    = true;
 						$this->current_host         = "$host:$port";
 						$this->dbh2host[ $dbhname ] = "$host:$port";
 						$queries                    = 1;
 						$lag                        = isset( $this->lag ) ? $this->lag : 0;
-						$this->last_connection      = compact( 'dbhname', 'host', 'port', 'user', 'name', 'tcp', 'elapsed', 'success', 'queries', 'lag' );
+						$this->last_connection      = array( $dbhname, $host, $port, $user, $name, $tcp, $elapsed, $success, $queries, $lag );
 						$this->db_connections[]     = $this->last_connection;
 						$this->open_connections[]   = $dbhname;
 						break;
@@ -669,14 +623,14 @@ class hyperdb extends wpdb {
 				}
 
 				$success                = false;
-				$this->last_connection  = compact( 'dbhname', 'host', 'port', 'user', 'name', 'tcp', 'elapsed', 'success' );
+				$this->last_connection  = array( $dbhname, $host, $port, $user, $name, $tcp, $elapsed, $success );
 				$this->db_connections[] = $this->last_connection;
 				$msg                    = date( "Y-m-d H:i:s" ) . " Can't select $dbhname - \n";
 				$msg .= "'referrer' => '{$_SERVER['HTTP_HOST']}{$_SERVER['REQUEST_URI']}',\n";
 				$msg .= "'server' => {$server},\n";
 				$msg .= "'host' => {$host},\n";
-				$msg .= "'error' => " . $error_db_function() . ",\n";
-				$msg .= "'errno' => " . $error_db_function() . ",\n";
+				$msg .= "'error' => " . $this->get_last_error( $this->dbhs[ $dbhname ] ) . ",\n";
+				$msg .= "'errno' => " . $this->get_last_error( $this->dbhs[ $dbhname ] ) . ",\n";
 				$msg .= "'tcp_responsive' => " . ( $tcp === true ? 'true' : $tcp ) . ",\n";
 				$msg .= "'lagged_status' => " . ( isset( $lagged_status ) ? $lagged_status : HYPERDB_LAG_UNKNOWN );
 
@@ -719,7 +673,7 @@ class hyperdb extends wpdb {
 
 		$this->dbh = $this->dbhs[ $dbhname ]; // needed by $wpdb->_real_escape()
 
-		$this->last_used_server = compact( 'host', 'user', 'name', 'read', 'write' );
+		$this->last_used_server = array( $host, $user, $name, $read, $write );
 
 		$this->used_servers[ $dbhname ] = $this->last_used_server;
 
@@ -731,6 +685,108 @@ class hyperdb extends wpdb {
 		}
 
 		return $this->dbhs[ $dbhname ];
+	}
+
+	/**
+	 * @param $name
+	 * @param $db
+	 *
+	 * @return bool
+	 */
+	protected function select_db( $name, $db ) {
+		if ( $this->use_mysqli ) {
+			return mysqli_select_db( $db, $name );
+		} else {
+			return mysql_select_db( $name, $db );
+		}
+	}
+
+	/**
+	 * @param $dbh
+	 *
+	 * @return string
+	 */
+	protected function get_last_error( $dbh ) {
+		if ( is_resource( $dbh ) ) {
+			if ( $this->use_mysqli ) {
+				return mysqli_error( $dbh );
+			} else {
+				return mysql_error( $dbh );
+			}
+		}
+
+		return "";
+
+	}
+
+	/**
+	 * @param $host
+	 * @param $username
+	 * @param $password
+	 *
+	 * @return bool|mysqli|resource
+	 */
+	protected function db_connect_single( $host, $username, $password, $port = null ) {
+		$this->is_mysql = true;
+		$dbh            = false;
+		/*
+		 * Deprecated in 3.9+ when using MySQLi. No equivalent
+		 * $new_link parameter exists for mysqli_* functions.
+		 */
+		$new_link     = defined( 'MYSQL_NEW_LINK' ) ? MYSQL_NEW_LINK : true;
+		$client_flags = defined( 'MYSQL_CLIENT_FLAGS' ) ? MYSQL_CLIENT_FLAGS : 0;
+
+		if ( $this->use_mysqli ) {
+			$dbh = mysqli_init();
+
+			// mysqli_real_connect doesn't support the host param including a port or socket
+			// like mysql_connect does. This duplicates how mysql_connect detects a port and/or socket file.
+			$socket         = null;
+			$port_or_socket = strstr( $host, ':' );
+			if ( ! empty( $port_or_socket ) ) {
+				$host           = substr( $host, 0, strpos( $host, ':' ) );
+				$port_or_socket = substr( $port_or_socket, 1 );
+				if ( 0 !== strpos( $port_or_socket, '/' ) ) {
+					$port         = intval( $port_or_socket );
+					$maybe_socket = strstr( $port_or_socket, ':' );
+					if ( ! empty( $maybe_socket ) ) {
+						$socket = substr( $maybe_socket, 1 );
+					}
+				} else {
+					$socket = $port_or_socket;
+				}
+			}
+
+			mysqli_real_connect( $dbh, $host, $username, $password, null, $port, $socket, $client_flags );
+
+			if ( $dbh->connect_errno ) {
+				$dbh = null;
+				/* It's possible ext/mysqli is misconfigured. Fall back to ext/mysql if:
+		 		 *  - We haven't previously connected, and
+		 		 *  - WP_USE_EXT_MYSQL isn't set to false, and
+		 		 *  - ext/mysql is loaded.
+		 		 */
+				$attempt_fallback = true;
+				if ( defined( 'WP_USE_EXT_MYSQL' ) && ! WP_USE_EXT_MYSQL ) {
+					$attempt_fallback = false;
+				} elseif ( ! function_exists( 'mysql_connect' ) ) {
+					$attempt_fallback = false;
+				}
+				if ( $attempt_fallback ) {
+					$this->use_mysqli = false;
+					return $this->db_connect_single( $host, $username, $password, $port );
+				}
+			}
+
+		} else {
+			if ( $this->persistent ) {
+				$dbh = mysql_pconnect( "$host:$port", $username, $password, $new_link, $client_flags );
+			} else {
+				$dbh = mysql_connect( "$host:$port", $username, $password, $new_link, $client_flags );
+			}
+		}
+
+		return $dbh;
 	}
 
 
@@ -759,19 +815,40 @@ class hyperdb extends wpdb {
 	 * @param string $dbhname
 	 */
 	function disconnect( $dbhname ) {
-		if ( $k = array_search( $dbhname, $this->open_connections ) ) {
+		$this->dbclose = $dbhname;
+		$this->close();
+		$this->dbclose = false;
+	}
+
+	/**
+	 * Closes the current database connection.
+	 *
+	 * @since 4.5.0
+	 * @access public
+	 *
+	 * @return bool True if the connection was successfully closed, false if it wasn't,
+	 *              or the connection doesn't exist.
+	 */
+	public function close() {
+		if ( ! $this->dbclose ) {
+			return false;
+		}
+		if ( $k = array_search( $this->dbclose, $this->open_connections ) ) {
 			unset( $this->open_connections[ $k ] );
 		}
-
-		if ( is_resource( $this->dbhs[ $dbhname ] ) ) {
+		if ( is_resource( $this->dbhs[ $this->dbclose ] ) ) {
 			if ( $this->use_mysqli ) {
-				mysqli_close( $this->dbhs[ $dbhname ] );
+				$closed = mysqli_close( $this->dbclose );
 			} else {
-				mysql_close( $this->dbhs[ $dbhname ] );
+				$closed = mysql_close( $this->dbclose );
 			}
 		}
+		unset( $this->dbhs[ $this->dbclose ] );
+		if ( $closed ) {
+			$this->dbclose = false;
+		}
 
-		unset( $this->dbhs[ $dbhname ] );
+		return $closed;
 	}
 
 	/**
@@ -793,6 +870,16 @@ class hyperdb extends wpdb {
 	function query( $query ) {
 		// some queries are made before the plugins have been loaded, and thus cannot be filtered with this method
 		if ( function_exists( 'apply_filters' ) ) {
+			/**
+			 * Filter the database query.
+			 *
+			 * Some queries are made before the plugins have been loaded,
+			 * and thus cannot be filtered with this method.
+			 *
+			 * @since 2.1.0
+			 *
+			 * @param string $query Database query.
+			 */
 			$query = apply_filters( 'query', $query );
 		}
 
@@ -800,15 +887,33 @@ class hyperdb extends wpdb {
 		$return_val = 0;
 		$this->flush();
 
+		// Reset elapsed
+		$this->elapsed = 0;
+
 		// Log how the function was called
 		$this->func_call = "\$db->query(\"$query\")";
+
+		// If we're writing to the database, make sure the query will write safely.
+		if ( $this->check_current_query && ! $this->check_ascii( $query ) ) {
+			$stripped_query = $this->strip_invalid_text_from_query( $query );
+			// strip_invalid_text_from_query() can perform queries, so we need
+			// to flush again, just to make sure everything is clear.
+			$this->flush();
+			if ( $stripped_query !== $query ) {
+				$this->insert_id = 0;
+
+				return false;
+			}
+		}
+
+		$this->check_current_query = true;
 
 		// Keep track of the last query for debug..
 		$this->last_query = $query;
 
 		if ( preg_match( '/^\s*SELECT\s+FOUND_ROWS(\s*)/i', $query ) && is_resource( $this->last_found_rows_result ) ) {
-			$this->result = $this->last_found_rows_result;
-			$elapsed      = 0;
+			$this->result  = $this->last_found_rows_result;
+			$this->elapsed = 0;
 		} else {
 			$this->dbh = $this->db_connect( $query );
 
@@ -816,53 +921,42 @@ class hyperdb extends wpdb {
 				return false;
 			}
 
-			$this->timer_start();
-			if ( $this->use_mysqli ) {
-				$this->result = mysqli_query( $query, $this->dbh );
-			} else {
-				$this->result = mysql_query( $query, $this->dbh );
-			}
-			$elapsed = $this->timer_stop();
-			$this->num_queries++;
+			$this->_do_query( $query );
 
 			if ( preg_match( '/^\s*SELECT\s+SQL_CALC_FOUND_ROWS\s/i', $query ) ) {
 				if ( false === strpos( $query, "NO_SELECT_FOUND_ROWS" ) ) {
 					$this->timer_start();
-
 					if ( $this->use_mysqli ) {
-						$this->last_found_rows_result = mysqli_query( "SELECT FOUND_ROWS()", $this->dbh );
+						$this->last_found_rows_result = mysqli_query( $this->dbh, "SELECT FOUND_ROWS()" );
 					} else {
 						$this->last_found_rows_result = mysql_query( "SELECT FOUND_ROWS()", $this->dbh );
 					}
 
-					$elapsed += $this->timer_stop();
-					$this->num_queries++;
+					$this->elapsed += $this->timer_stop();
+					$this->num_queries ++;
 					$query .= "; SELECT FOUND_ROWS()";
 				}
 			} else {
 				$this->last_found_rows_result = null;
 			}
 
-			if ( $this->save_queries || ( defined( 'SAVEQUERIES' ) && SAVEQUERIES )) {
+			if ( $this->save_queries || ( defined( 'SAVEQUERIES' ) && SAVEQUERIES ) ) {
 				if ( is_callable( $this->save_query_callback ) ) {
 					$this->queries[] = call_user_func_array( $this->save_query_callback, array(
 						$query,
-						$elapsed,
+						$this->elapsed,
 						$this->save_backtrace ? debug_backtrace( false ) : null,
 						&$this
 					) );
 				} else {
-					$this->queries[] = array( $query, $elapsed, $this->get_caller() );
+					$this->queries[] = array( $query, $this->elapsed, $this->get_caller() );
 				}
 			}
 		}
 
 		// If there is an error then take note of it
-		if ( $this->use_mysqli ) {
-			$this->last_error = mysqli_error( $this->dbh );
-		} else {
-			$this->last_error = mysql_error( $this->dbh );
-		}
+		$this->last_error =  $this->get_last_error( $this->dbh );
+
 
 		if ( $this->last_error ) {
 			$this->print_error( $this->last_error );
@@ -888,32 +982,31 @@ class hyperdb extends wpdb {
 			// Return number of rows affected
 			$return_val = $this->rows_affected;
 		} else {
-			$i              = 0;
-			$this->col_info = array();
+			$i                 = 0;
+			$this->col_info    = array();
+			$num_rows          = 0;
+			$this->last_result = array();
 			if ( $this->use_mysqli ) {
-				while ( $i < @mysqli_num_fields( $this->result ) ) {
-					$this->col_info[ $i ] = @mysqli_fetch_field( $this->result );
+				while ( $i < mysqli_num_fields( $this->result ) ) {
+					$this->col_info[ $i ] = mysqli_fetch_field( $this->result );
 					$i ++;
 				}
-				$num_rows          = 0;
-				$this->last_result = array();
-				while ( $row = @mysqli_fetch_object( $this->result ) ) {
+
+				while ( $row = mysqli_fetch_object( $this->result ) ) {
 					$this->last_result[ $num_rows ] = $row;
 					$num_rows ++;
 				}
 				@mysqli_free_result( $this->result );
-			} else{
-				while ( $i < @mysql_num_fields( $this->result ) ) {
-					$this->col_info[ $i ] = @mysql_fetch_field( $this->result );
+			} else {
+				while ( $i < mysql_num_fields( $this->result ) ) {
+					$this->col_info[ $i ] = mysql_fetch_field( $this->result );
 					$i ++;
 				}
-				$num_rows          = 0;
-				$this->last_result = array();
-				while ( $row = @mysql_fetch_object( $this->result ) ) {
+				while ( $row = mysql_fetch_object( $this->result ) ) {
 					$this->last_result[ $num_rows ] = $row;
 					$num_rows ++;
 				}
-				@mysql_free_result( $this->result );
+				mysql_free_result( $this->result );
 			}
 
 			// Log number of rows the query returned
@@ -927,53 +1020,24 @@ class hyperdb extends wpdb {
 	}
 
 	/**
-	 * Determine if a database supports a particular feature.
+	 * Internal function to perform the mysql_query() call.
 	 *
-	 * @since 2.7.0
-	 * @since 4.1.0 Support was added for the 'utf8mb4' feature.
+	 * @since 3.9.0
 	 *
-	 * @see wpdb::db_version()
+	 * @access private
+	 * @see wpdb::query()
 	 *
-	 * @param string $db_cap The feature to check for. Accepts 'collation',
-	 *                       'group_concat', 'subqueries', 'set_charset',
-	 *                       or 'utf8mb4'.
-	 *
-	 * @return int|false Whether the database feature is supported, false otherwise.
+	 * @param string $query The query to run.
 	 */
-	public function has_cap( $db_cap ) {
-		$version = $this->db_version();
-
-		switch ( strtolower( $db_cap ) ) {
-			case 'collation' :    // @since 2.5.0
-			case 'group_concat' : // @since 2.7.0
-			case 'subqueries' :   // @since 2.7.0
-				return version_compare( $version, '4.1', '>=' );
-			case 'set_charset' :
-				return version_compare( $version, '5.0.7', '>=' );
-			case 'utf8mb4' :      // @since 4.1.0
-				if ( version_compare( $version, '5.5.3', '<' ) ) {
-					return false;
-				}
-				if ( $this->use_mysqli ) {
-					$client_version = mysqli_get_client_info();
-				} else {
-					$client_version = mysql_get_client_info();
-				}
-
-				/*
-				 * libmysql has supported utf8mb4 since 5.5.3, same as the MySQL server.
-				 * mysqlnd has supported utf8mb4 since 5.0.9.
-				 */
-				if ( false !== strpos( $client_version, 'mysqlnd' ) ) {
-					$client_version = preg_replace( '/^\D+([\d.]+).*/', '$1', $client_version );
-
-					return version_compare( $client_version, '5.0.9', '>=' );
-				} else {
-					return version_compare( $client_version, '5.5.3', '>=' );
-				}
+	private function _do_query( $query ) {
+		$this->timer_start();
+		if ( $this->use_mysqli ) {
+			$this->result = mysqli_query( $this->dbh, $query );
+		} else {
+			$this->result = mysql_query( $query, $this->dbh );
 		}
-
-		return false;
+		$this->num_queries ++;
+		$this->elapsed += $this->timer_stop();
 	}
 
 	/**
@@ -996,8 +1060,9 @@ class hyperdb extends wpdb {
 			if ( $this->use_mysqli ) {
 				$server_info = mysqli_get_server_info( $dbh );
 			} else {
-				$server_info = mysql_get_server_info( $dbh);
+				$server_info = mysql_get_server_info( $dbh );
 			}
+
 			return preg_replace( '/[^0-9.].*/', '', $server_info );
 		}
 
@@ -1049,7 +1114,7 @@ class hyperdb extends wpdb {
 	 * @param $port
 	 * @param $float_timeout
 	 *
-	 * @return bool|string 	true when $host:$post responds within $float_timeout seconds, else (bool) false
+	 * @return bool|string    true when $host:$post responds within $float_timeout seconds, else (bool) false
 	 */
 	function check_tcp_responsiveness( $host, $port, $float_timeout ) {
 		if ( function_exists( 'apc_store' ) ) {
