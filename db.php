@@ -803,7 +803,7 @@ class hyperdb extends wpdb {
 			wp_die( "$charset charset isn't supported in HyperDB for security reasons" );
 		}
 		if ( false !== stripos( $collate, 'big5' ) || false !== stripos( $collate, 'gbk' ) ) {
-			wp_die( "$collation collation isn't supported in HyperDB for security reasons" );
+			wp_die( "$collate collation isn't supported in HyperDB for security reasons" );
 		}
 
 		parent::set_charset( $dbh, $charset, $collate );
@@ -1038,6 +1038,26 @@ class hyperdb extends wpdb {
 		}
 		$this->num_queries ++;
 		$this->elapsed += $this->timer_stop();
+	}
+
+	/**
+	 * Whether MySQL database is at least the required minimum version.
+	 *
+	 * @since 2.5.0
+	 *
+	 * @global string $wp_version
+	 * @global string $required_mysql_version
+	 *
+	 * @return WP_Error|void
+	 */
+	function check_database_version( $dbh_or_table = false ) {
+		global $wp_version, $required_mysql_version;
+		// Make sure the server has the required MySQL version
+		$mysql_version = preg_replace( '|[^0-9\.]|', '', $this->db_version( $dbh_or_table ) );
+		if ( version_compare( $mysql_version, $required_mysql_version, '<' ) ) {
+			return new WP_Error('database_version', sprintf( __( '<strong>ERROR</strong>: WordPress %1$s requires MySQL %2$s or higher' ), $wp_version, $required_mysql_version ));
+
+		}
 	}
 
 	/**
